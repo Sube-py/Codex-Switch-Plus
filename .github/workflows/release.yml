@@ -259,6 +259,6 @@ jobs:
             Automated release for ${{ github.ref_name }}.
 
             Please check the attached assets for installers and bundles.
-          releaseDraft: true
+          releaseDraft: false
           prerelease: false
           tauriScript: pnpm tauri
