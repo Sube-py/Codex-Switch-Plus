@@ -1,0 +1,264 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version without 'v' prefix, e.g. 0.1.0"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref_name }}-${{ github.event_name }}
+  cancel-in-progress: false
+
+jobs:
+  prepare_version_and_tag:
+    name: Prepare version and tag
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Validate version input
+        env:
+          RELEASE_VERSION: ${{ inputs.version }}
+        shell: bash
+        run: |
+          if [[ ! "$RELEASE_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+([-.][0-9A-Za-z.-]+)?$ ]]; then
+            echo "Invalid version: $RELEASE_VERSION" >&2
+            echo "Expected like 0.1.0 or 1.2.3-rc.1" >&2
+            exit 1
+          fi
+
+      - name: Ensure tag does not already exist
+        env:
+          RELEASE_TAG: v${{ inputs.version }}
+        shell: bash
+        run: |
+          git fetch --tags --force
+          if git ls-remote --exit-code --tags origin "refs/tags/${RELEASE_TAG}" >/dev/null 2>&1; then
+            echo "Tag ${RELEASE_TAG} already exists on remote." >&2
+            exit 1
+          fi
+
+      - name: Sync version in project files
+        env:
+          RELEASE_VERSION: ${{ inputs.version }}
+        shell: bash
+        run: |
+          node - <<'NODE'
+          const fs = require('node:fs');
+
+          const version = process.env.RELEASE_VERSION;
+          if (!version) {
+            throw new Error('RELEASE_VERSION is missing');
+          }
+
+          const packagePath = 'package.json';
+          const tauriConfigPath = 'src-tauri/tauri.conf.json';
+          const cargoTomlPath = 'src-tauri/Cargo.toml';
+
+          const pkg = JSON.parse(fs.readFileSync(packagePath, 'utf8'));
+          pkg.version = version;
+          fs.writeFileSync(packagePath, `${JSON.stringify(pkg, null, 2)}\n`);
+
+          const tauriConfig = JSON.parse(fs.readFileSync(tauriConfigPath, 'utf8'));
+          tauriConfig.version = version;
+          fs.writeFileSync(tauriConfigPath, `${JSON.stringify(tauriConfig, null, 2)}\n`);
+
+          const cargoLines = fs.readFileSync(cargoTomlPath, 'utf8').split('\n');
+          let inPackage = false;
+          let replaced = false;
+
+          for (let i = 0; i < cargoLines.length; i += 1) {
+            const line = cargoLines[i];
+            if (/^\[package\]\s*$/.test(line.trim())) {
+              inPackage = true;
+              continue;
+            }
+
+            if (inPackage && /^\[[^\]]+\]\s*$/.test(line.trim())) {
+              inPackage = false;
+            }
+
+            if (inPackage && /^version\s*=/.test(line.trim())) {
+              cargoLines[i] = `version = "${version}"`;
+              replaced = true;
+              break;
+            }
+          }
+
+          if (!replaced) {
+            throw new Error('Failed to update [package].version in src-tauri/Cargo.toml');
+          }
+
+          fs.writeFileSync(cargoTomlPath, `${cargoLines.join('\n')}\n`);
+          NODE
+
+      - name: Commit version changes
+        env:
+          RELEASE_VERSION: ${{ inputs.version }}
+          TARGET_BRANCH: ${{ github.ref_name }}
+        shell: bash
+        run: |
+          if git diff --quiet -- package.json src-tauri/tauri.conf.json src-tauri/Cargo.toml; then
+            echo "Version already up to date."
+          else
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add package.json src-tauri/tauri.conf.json src-tauri/Cargo.toml
+            git commit -m "chore(release): bump version to ${RELEASE_VERSION}"
+            git push origin "HEAD:${TARGET_BRANCH}"
+          fi
+
+      - name: Create and push tag
+        env:
+          RELEASE_TAG: v${{ inputs.version }}
+        shell: bash
+        run: |
+          git tag "${RELEASE_TAG}" HEAD
+          git push origin "${RELEASE_TAG}"
+
+      - name: Summary
+        env:
+          RELEASE_TAG: v${{ inputs.version }}
+        run: |
+          echo "Created ${RELEASE_TAG}."
+          echo "A new workflow run will start from the pushed tag and build the release assets."
+
+  validate_versions_for_tag:
+    name: Validate versions for tag
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Validate tag and file versions
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        shell: bash
+        run: |
+          node - <<'NODE'
+          const fs = require('node:fs');
+
+          const tag = process.env.RELEASE_TAG;
+          if (!tag || !tag.startsWith('v')) {
+            throw new Error(`Invalid tag: ${tag}`);
+          }
+
+          const version = tag.slice(1);
+
+          const pkg = JSON.parse(fs.readFileSync('package.json', 'utf8')).version;
+          const tauri = JSON.parse(fs.readFileSync('src-tauri/tauri.conf.json', 'utf8')).version;
+
+          const cargoLines = fs.readFileSync('src-tauri/Cargo.toml', 'utf8').split('\n');
+          let inPackage = false;
+          let cargoVersion = null;
+
+          for (const line of cargoLines) {
+            const trimmed = line.trim();
+
+            if (/^\[package\]$/.test(trimmed)) {
+              inPackage = true;
+              continue;
+            }
+
+            if (inPackage && /^\[[^\]]+\]$/.test(trimmed)) {
+              inPackage = false;
+            }
+
+            if (inPackage && /^version\s*=/.test(trimmed)) {
+              const match = trimmed.match(/^version\s*=\s*"([^"]+)"$/);
+              cargoVersion = match ? match[1] : null;
+              break;
+            }
+          }
+
+          if (!cargoVersion) {
+            throw new Error('Cannot read [package].version from src-tauri/Cargo.toml');
+          }
+
+          const mismatches = [];
+          if (pkg !== version) mismatches.push(`package.json=${pkg}`);
+          if (tauri !== version) mismatches.push(`tauri.conf.json=${tauri}`);
+          if (cargoVersion !== version) mismatches.push(`Cargo.toml=${cargoVersion}`);
+
+          if (mismatches.length > 0) {
+            throw new Error(`Version mismatch for ${tag}: ${mismatches.join(', ')}`);
+          }
+
+          console.log(`Version check passed for ${tag}`);
+          NODE
+
+  release:
+    name: Build and draft release (${{ matrix.platform }})
+    if: github.event_name == 'push'
+    needs: validate_versions_for_tag
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: macos-latest
+          - platform: windows-latest
+          - platform: ubuntu-22.04
+    runs-on: ${{ matrix.platform }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: "9"
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "pnpm"
+          cache-dependency-path: pnpm-lock.yaml
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install Linux system dependencies
+        if: matrix.platform == 'ubuntu-22.04'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libgtk-3-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            patchelf
+
+      - name: Install frontend dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build artifacts and upload to GitHub release
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        with:
+          tagName: ${{ github.ref_name }}
+          releaseName: Codex Switch+ ${{ github.ref_name }}
+          releaseBody: |
+            Automated release for ${{ github.ref_name }}.
+
+            Please check the attached assets for installers and bundles.
+          releaseDraft: true
+          prerelease: false
+          tauriScript: pnpm tauri
